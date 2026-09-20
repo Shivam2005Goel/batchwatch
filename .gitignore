@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.aws-sam/
+# node
+node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+# local state
+.local/
+data/pdfs/*.pdf
+data/raw_rows/
+# env
+.env
+.env.*
+!.env.example
+
+# `sam deploy --guided` writes the real AdminKey into samconfig.toml.
+# Ship samconfig.toml.example instead and keep the live one local.
+samconfig.toml

@@ -1,0 +1,7 @@
+pytest==9.0.2
+rapidfuzz==3.14.6
+pdfplumber==0.11.10
+requests==2.34.2
+boto3>=1.34
+anthropic[bedrock]==0.120.0
+PyYAML>=6.0

@@ -1,0 +1,33 @@
+# Copy to samconfig.toml (which is gitignored) or just run `sam deploy --guided`,
+# which writes one for you. Never commit the real AdminKey.
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "batchwatch"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+region = "us-east-1"
+parameter_overrides = [
+  "Stage=dev",
+  "BedrockModel=anthropic.claude-opus-5",
+  "BedrockRegion=us-east-1",
+  # Override on the command line - do not commit a real key:
+  #   sam deploy --parameter-overrides AdminKey=$(openssl rand -hex 16)
+  "AdminKey=change-me-before-you-deploy",
+  "SesFromAddress=",
+  "CorsOrigin=*",
+]
+
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"

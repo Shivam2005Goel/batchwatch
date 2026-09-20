@@ -1,0 +1,113 @@
+{
+  "Comment": "BatchWatch monthly ingest: fetch CDSCO alert PDFs, extract their tables, normalise them onto the canonical schema, then fan newly flagged batches out to the shelves holding them.",
+  "StartAt": "Fetch",
+  "States": {
+    "Fetch": {
+      "Type": "Task",
+      "Resource": "${FetchArn}",
+      "ResultPath": "$.fetch",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed"}],
+      "Next": "AnyNewDocuments"
+    },
+
+    "AnyNewDocuments": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.fetch.documents[0]",
+          "IsPresent": true,
+          "Next": "ProcessDocuments"
+        }
+      ],
+      "Default": "NothingNew"
+    },
+
+    "NothingNew": {
+      "Type": "Succeed",
+      "Comment": "Every published alert is already in the corpus."
+    },
+
+    "ProcessDocuments": {
+      "Type": "Map",
+      "ItemsPath": "$.fetch.documents",
+      "MaxConcurrency": 3,
+      "Parameters": {
+        "run_id.$": "$.fetch.run_id",
+        "url.$": "$$.Map.Item.Value.url",
+        "pdf_ref.$": "$$.Map.Item.Value.pdf_ref",
+        "alert_month.$": "$$.Map.Item.Value.alert_month"
+      },
+      "ResultPath": "$.processed",
+      "Iterator": {
+        "StartAt": "Extract",
+        "States": {
+          "Extract": {
+            "Type": "Task",
+            "Resource": "${ExtractArn}",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "Normalise"
+          },
+          "Normalise": {
+            "Type": "Task",
+            "Resource": "${NormaliseArn}",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed"}],
+      "Next": "Fanout"
+    },
+
+    "Fanout": {
+      "Type": "Task",
+      "Resource": "${FanoutArn}",
+      "Comment": "The reverse lookup: whose shelf holds a batch that was just flagged?",
+      "Parameters": {
+        "run_id.$": "$.fetch.run_id",
+        "canonical_refs.$": "$.processed[*].canonical_ref",
+        "urls.$": "$.processed[*].url",
+        "deep": true
+      },
+      "ResultPath": "$.fanout",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed"}],
+      "End": true
+    },
+
+    "Failed": {
+      "Type": "Fail",
+      "Error": "IngestFailed",
+      "Cause": "See the error field in the execution output and the Lambda logs."
+    }
+  }
+}

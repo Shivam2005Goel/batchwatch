@@ -1,0 +1,7 @@
+{
+  "include": ["functions", "scripts", "tests"],
+  "extraPaths": ["functions/common/python"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning"
+}

@@ -1,0 +1,427 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  BatchWatch - a drug recall that travels backwards in time, to the person who
+  already bought the strip. One DynamoDB table, one GSI, a read path measured in
+  milliseconds and a monthly ingest loop that fans newly flagged batches out to
+  the shelves holding them.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  BedrockModel:
+    Type: String
+    Default: anthropic.claude-opus-5
+    Description: Bedrock model id (carries the anthropic. provider prefix)
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+  AdminKey:
+    Type: String
+    NoEcho: true
+    Description: Shared secret for POST /admin/ingest - used to trigger the demo
+    MinLength: 16
+  SesFromAddress:
+    Type: String
+    Default: ""
+    Description: Verified SES sender. Leave empty to disable email and use in-app alerts only.
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: Set to the Amplify URL once it exists.
+  ScanRateLimit:
+    Type: Number
+    Default: 5
+    Description: Requests per second for POST /scan - vision calls cost money.
+  ScanBurstLimit:
+    Type: Number
+    Default: 10
+  Architecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+    Description: >
+      arm64 is ~20% cheaper per ms, but `sam build --use-container` has to
+      emulate it on an x86 laptop, which is slow and occasionally fails on
+      compiled wheels. x86_64 is the safer first deploy; switch once it works.
+  RequireLogin:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      true  - shelf and pharmacy routes sit behind the Cognito JWT authorizer.
+      false - they are open at the gateway and the caller is identified by an
+              X-Device-Id header, which is a namespace, not a security
+              boundary. Anyone holding the device id can read that shelf.
+              Fine for a demo on your own phone; set true before anyone else
+              stores their medicines in it.
+
+Conditions:
+  HasSes: !Not [!Equals [!Ref SesFromAddress, ""]]
+  LoginRequired: !Equals [!Ref RequireLogin, "true"]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [!Ref Architecture]
+    Timeout: 30
+    MemorySize: 1024
+    Layers: [!Ref CommonLayer]
+    Environment:
+      Variables:
+        BW_STORE: dynamodb
+        BW_TABLE: !Ref Table
+        BW_RAW_BUCKET: !Ref RawBucket
+        BW_BEDROCK_MODEL: !Ref BedrockModel
+        BW_BEDROCK_REGION: !Ref BedrockRegion
+        BW_CORS_ORIGIN: !Ref CorsOrigin
+        BW_SES_FROM: !Ref SesFromAddress
+        # With RequireLogin=true identity comes from the Cognito JWT and the
+        # device-id header is ignored. See the RequireLogin parameter.
+        BW_ALLOW_DEVICE_ID: !If [LoginRequired, "0", "1"]
+        BW_INDEX_VERSION: "1"
+        POWERTOOLS_LOG_LEVEL: INFO
+
+Resources:
+  # ----------------------------------------------------------------- storage
+
+  Table:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub batchwatch-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+        - {AttributeName: GSI1PK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        # The reverse lookup the whole product rests on:
+        # "this batch was just flagged - whose shelf is it on?"
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: GSI1PK, KeyType: HASH}
+            - {AttributeName: SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        # Scan caches and pharmacy jobs self-delete.
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub batchwatch-raw-${Stage}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-source-pdfs
+            Status: Enabled
+            Prefix: cdsco/
+            ExpirationInDays: 90
+          - Id: expire-intermediate-run-data
+            Status: Enabled
+            Prefix: runs/
+            ExpirationInDays: 7
+
+  # -------------------------------------------------------------------- auth
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub batchwatch-${Stage}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub batchwatch-web-${Stage}
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders: [COGNITO]
+
+  # --------------------------------------------------------------------- api
+
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins: [!Ref CorsOrigin]
+        AllowHeaders: [content-type, authorization, x-admin-key, x-device-id]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+      Auth:
+        Authorizers:
+          CognitoAuth:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              audience: [!Ref UserPoolClient]
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 50
+        ThrottlingBurstLimit: 100
+      RouteSettings:
+        # Vision calls cost money and an open endpoint is a bill waiting to happen.
+        "POST /scan":
+          ThrottlingRateLimit: !Ref ScanRateLimit
+          ThrottlingBurstLimit: !Ref ScanBurstLimit
+
+  # ------------------------------------------------------------------- layer
+
+  # Source only, deliberately with no BuildMethod: SAM then zips ContentUri
+  # verbatim, so functions/common/python/batchwatch_common lands on the runtime
+  # path unchanged. Third-party wheels come from each function's own
+  # requirements.txt instead.
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub batchwatch-common-${Stage}
+      ContentUri: functions/common/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [!Ref Architecture]
+      RetentionPolicy: Delete
+
+  # --------------------------------------------------------------- read path
+
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/scan/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 1536
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource: "*"
+      Events:
+        Scan:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scan
+            Method: POST
+            # Deliberately public: making someone sign up before they can see
+            # what the thing does costs more than the auth story gains.
+            Auth: {Authorizer: NONE}
+
+  SearchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/search/
+      Handler: app.lambda_handler
+      MemorySize: 1536
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref Table}
+      Events:
+        Search:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /search
+            Method: GET
+            Auth: {Authorizer: NONE}
+        Stats:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /stats
+            Method: GET
+            Auth: {Authorizer: NONE}
+
+  ShelfFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/shelf/
+      Handler: app.lambda_handler
+      MemorySize: 1536
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+      Events:
+        ListShelf:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /shelf, Method: GET, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+        AddShelf:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /shelf, Method: POST, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+        DeleteShelf:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: "/shelf/{id}", Method: DELETE, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+        Alerts:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /alerts, Method: GET, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+
+  PharmacyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/pharmacy/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 2048
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+      Events:
+        Check:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /pharmacy/check, Method: POST, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+        Results:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: "/pharmacy/check/{id}", Method: GET, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+
+  # ------------------------------------------------------------- ingest loop
+
+  AdminFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/admin/
+      Handler: app.lambda_handler
+      Timeout: 120
+      MemorySize: 2048
+      Environment:
+        Variables:
+          BW_ADMIN_KEY: !Ref AdminKey
+          BW_STATE_MACHINE_ARN: !Ref IngestStateMachine
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - StepFunctionsExecutionPolicy: {StateMachineName: !GetAtt IngestStateMachine.Name}
+        - !If
+          - HasSes
+          - Statement:
+              - Effect: Allow
+                Action: [ses:SendEmail]
+                Resource: "*"
+          - !Ref AWS::NoValue
+      Events:
+        Ingest:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /admin/ingest, Method: POST, Auth: {Authorizer: NONE}}
+
+  IngestFetchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/ingest/fetch/
+      Handler: app.lambda_handler
+      Timeout: 300
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3CrudPolicy: {BucketName: !Ref RawBucket}
+
+  IngestExtractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/ingest/extract/
+      Handler: app.lambda_handler
+      Timeout: 300
+      MemorySize: 2048
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3CrudPolicy: {BucketName: !Ref RawBucket}
+        - Statement:
+            - Effect: Allow
+              Action: [textract:AnalyzeDocument]
+              Resource: "*"
+
+  IngestNormaliseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/ingest/normalise/
+      Handler: app.lambda_handler
+      Timeout: 900
+      MemorySize: 2048
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3CrudPolicy: {BucketName: !Ref RawBucket}
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource: "*"
+
+  IngestFanoutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/ingest/fanout/
+      Handler: app.lambda_handler
+      Timeout: 900
+      MemorySize: 2048
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3CrudPolicy: {BucketName: !Ref RawBucket}
+        - !If
+          - HasSes
+          - Statement:
+              - Effect: Allow
+                Action: [ses:SendEmail]
+                Resource: "*"
+          - !Ref AWS::NoValue
+
+  IngestStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub batchwatch-ingest-${Stage}
+      DefinitionUri: statemachine/ingest.asl.json
+      DefinitionSubstitutions:
+        FetchArn: !GetAtt IngestFetchFunction.Arn
+        ExtractArn: !GetAtt IngestExtractFunction.Arn
+        NormaliseArn: !GetAtt IngestNormaliseFunction.Arn
+        FanoutArn: !GetAtt IngestFanoutFunction.Arn
+      Policies:
+        - LambdaInvokePolicy: {FunctionName: !Ref IngestFetchFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref IngestExtractFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref IngestNormaliseFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref IngestFanoutFunction}
+      Events:
+        Monthly:
+          Type: ScheduleV2
+          Properties:
+            # CDSCO publishes monthly; check a few times so a late upload is
+            # picked up without waiting another month.
+            ScheduleExpression: cron(0 6 1,8,15 * ? *)
+            Description: Check cdsco.gov.in for new NSQ alerts
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the API
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  TableName:
+    Value: !Ref Table
+  RawBucketName:
+    Value: !Ref RawBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  StateMachineArn:
+    Value: !Ref IngestStateMachine
+  Region:
+    Value: !Ref AWS::Region
