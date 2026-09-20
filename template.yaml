@@ -234,7 +234,7 @@ Resources:
             Method: POST
             # Deliberately public: making someone sign up before they can see
             # what the thing does costs more than the auth story gains.
-            Auth: {Authorizer: NONE}
+
 
   SearchFunction:
     Type: AWS::Serverless::Function
@@ -251,14 +251,14 @@ Resources:
             ApiId: !Ref Api
             Path: /search
             Method: GET
-            Auth: {Authorizer: NONE}
+
         Stats:
           Type: HttpApi
           Properties:
             ApiId: !Ref Api
             Path: /stats
             Method: GET
-            Auth: {Authorizer: NONE}
+
 
   ShelfFunction:
     Type: AWS::Serverless::Function
