@@ -81,9 +81,9 @@ def _get_client():
         return _client
     with _client_lock:
         if _client is None:
-            from anthropic import AnthropicBedrockMantle
+            from anthropic import AnthropicBedrock
 
-            _client = AnthropicBedrockMantle(aws_region=region())
+            _client = AnthropicBedrock(aws_region=region())
     return _client
 
 
