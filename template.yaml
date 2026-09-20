@@ -271,16 +271,16 @@ Resources:
       Events:
         ListShelf:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: /shelf, Method: GET, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+          Properties: {ApiId: !Ref Api, Path: /shelf, Method: GET}
         AddShelf:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: /shelf, Method: POST, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+          Properties: {ApiId: !Ref Api, Path: /shelf, Method: POST}
         DeleteShelf:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: "/shelf/{id}", Method: DELETE, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+          Properties: {ApiId: !Ref Api, Path: "/shelf/{id}", Method: DELETE}
         Alerts:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: /alerts, Method: GET, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+          Properties: {ApiId: !Ref Api, Path: /alerts, Method: GET}
 
   PharmacyFunction:
     Type: AWS::Serverless::Function
@@ -294,10 +294,10 @@ Resources:
       Events:
         Check:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: /pharmacy/check, Method: POST, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+          Properties: {ApiId: !Ref Api, Path: /pharmacy/check, Method: POST}
         Results:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: "/pharmacy/check/{id}", Method: GET, Auth: !If [LoginRequired, {Authorizer: CognitoAuth}, {Authorizer: NONE}]}
+          Properties: {ApiId: !Ref Api, Path: "/pharmacy/check/{id}", Method: GET}
 
   # ------------------------------------------------------------- ingest loop
 
@@ -325,7 +325,7 @@ Resources:
       Events:
         Ingest:
           Type: HttpApi
-          Properties: {ApiId: !Ref Api, Path: /admin/ingest, Method: POST, Auth: {Authorizer: NONE}}
+          Properties: {ApiId: !Ref Api, Path: /admin/ingest, Method: POST}
 
   IngestFetchFunction:
     Type: AWS::Serverless::Function
